@@ -96,6 +96,10 @@ The OSs supported by Triton-Ascend are the same as those supported by CANN. Down
 
 - [Architecture Design and Core Features](./docs/en/architecture_design_and_core_features.md)
 
+- [Compiler Structure and Ascend Hardware Model](./docs/en/compiler_structure_and_hardware.md)
+
+- [Compiler Pass Guide with Ascend Hardware Rationale](./docs/en/compiler_passes_and_hardware.md)
+
 - [Operator Development Guide](./docs/en/programming_guide.md)
 
 - [Operator Migration Guide](./docs/en/migration_guide/migrate_from_gpu.md)

@@ -357,3 +357,274 @@ Output:
 ```
 
 The preceding logs indicate that the output on Triton is the same as that on PyTorch.
+
+## Hardware-Aware Compilation Walkthrough
+
+This section explains how the fused-attention example is compiled for Ascend NPUs and why each compiler stage exists from a hardware point of view.
+
+### 1. Why this kernel is a good Ascend case study
+
+This kernel stresses the exact compiler concerns that matter on Ascend:
+
+- it processes a long sequence dimension `N_CTX`, so the kernel must tile work instead of materializing the whole attention matrix at once,
+- it uses `tl.make_block_ptr`, `tl.advance`, `tl.load`, and `tl.store`, so address generation and memory regularity matter,
+- it uses `tl.where` for causal masking, which can trigger hardware-sensitive masked-access lowering,
+- it uses `tl.dot`, so the compiler must preserve enough structure for vector/cube-friendly lowering,
+- it carries online softmax state `m_i` and `l_i`, which avoids writing the full score matrix to global memory,
+- it contains a special `HEAD_DIM >= 256` path that uses `tl.extract_slice` and `tl.insert_slice` to avoid UB overflow by chunking accumulator updates.
+
+For Ascend hardware, these are direct responses to:
+
+- limited on-chip memory such as UB,
+- the need to keep data movement regular,
+- the need to bind work to physical cores efficiently,
+- the need to overlap transfer and compute when possible.
+
+### 2. Why the kernel uses fixed-core scheduling
+
+The kernel launches:
+
+```python
+_attn_fwd[(num_cores,)](...)
+```
+
+and then iterates:
+
+```python
+for block_idx in range(pid, NUM_BLOCKS, 20):
+```
+
+This is an Ascend-shaped scheduling style. The programming guide recommends binding the launch grid to the number of physical cores and then distributing extra logical work inside the kernel. That is different from the more common GPU mental model where programmers often over-subscribe a very large grid and rely on the GPU scheduler to manage it.
+
+Why this is useful on Ascend:
+
+- it reduces launch-side overhead when the logical task count is much larger than the physical core count,
+- it matches the documented hardware model where vector and cube resources are limited and should be used deliberately,
+- it gives the compiler and backend a more stable task shape to optimize.
+
+### 3. Why `BLOCK_M`, `BLOCK_N`, and `HEAD_DIM` are hardware-sensitive
+
+The block parameters are not just algorithmic tuning knobs.
+
+- `BLOCK_M` determines how many query rows are processed per tile.
+- `BLOCK_N` determines how many key/value rows are processed per tile.
+- `HEAD_DIM` controls the width of each block-local vector or matrix fragment.
+
+On Ascend, these parameters affect:
+
+- how much GM data must be transferred into UB,
+- whether multi-buffering still fits inside UB,
+- whether vector or cube resources can be used efficiently,
+- whether temporaries such as `q`, `k`, `v`, `p`, `pv`, and the accumulator still fit on chip.
+
+That is why the code introduces a separate path when `HEAD_DIM >= 256`. In that case the accumulator is updated in four slices:
+
+- this reduces peak UB demand,
+- it avoids carrying an oversized live temporary through the whole block update,
+- it gives later passes a chunked pattern that is easier to lower than one huge update.
+
+### 4. Stage-by-stage lowering
+
+The real stage pipeline is assembled in `third_party/ascend/backend/compiler.py`.
+
+#### 4.1 Python AST to TTIR
+
+The Triton frontend lowers the Python kernel to TTIR.
+
+At this stage, the compiler still sees:
+
+- Triton block pointers,
+- tensor-style loads and stores,
+- `tl.dot`,
+- `tl.where`,
+- loops over `BLOCK_N`,
+- explicit softmax bookkeeping with `m_i` and `l_i`.
+
+For fused attention, this is the last stage where the kernel still looks close to the algorithm.
+
+#### 4.2 TTIR cleanup
+
+The `ttir` stage runs:
+
+- `inliner`
+- `combine`
+- `canonicalizer`
+- `reorder_broadcast`
+- `cse`
+- `licm`
+- `symbol_dce`
+- `loop_unroll`
+
+Why this matters here:
+
+- repeated offset and mask expressions inside the attention loop can be deduplicated,
+- loop-invariant values can move out of inner loops,
+- the later hardware-aware passes receive cleaner pointer and mask structure,
+- a cleaner IR reduces the chance of unnecessary temporaries increasing UB pressure.
+
+With dump files enabled, this stage is captured as `kernel.ttir.mlir`.
+
+#### 4.3 Ascend restructuring and adapter lowering
+
+The `ttadapter` stage is the most important one for research. It runs:
+
+- `auto_blockify`
+- optional `dag_sync`, `dag_scope`, `dag_ssbuffer`
+- `triton_to_structure`
+- `discrete_mask_access_conversion`
+- `triton_to_annotation`
+- `triton_to_unstructure`
+- `triton_to_hivm`
+- `triton_to_hfusion`
+- `triton_to_llvm`
+- `bubble_up_operation`
+- `triton_to_structure` again
+- `triton_to_linalg`
+
+This sequence is where the kernel is turned from "Triton algorithm IR" into "Ascend-compilable IR."
+
+How these passes matter specifically for fused attention:
+
+- `auto_blockify`
+  - helps align logical attention blocks with a more hardware-feasible block schedule.
+- `dag_sync`, `dag_scope`, `dag_ssbuffer`
+  - become relevant because attention naturally alternates data movement and compute across tiles; these passes prepare pipeline-friendly scheduling and buffering.
+- `triton_to_structure`
+  - makes block-pointer and mask patterns more regular so later lowering can reason about GM-to-UB movement.
+- `discrete_mask_access_conversion`
+  - matters because causal masking and `tl.where` create cases where implicit irregular masking is not a good hardware fit.
+- `triton_to_unstructure`
+  - acts as a fallback if some memory or index behavior cannot remain in a clean structured form.
+- `triton_to_hivm`
+  - moves the kernel toward an execution model that can express Ascend synchronization and lower-level execution details.
+- `triton_to_hfusion`
+  - helps keep elementwise chains from creating unnecessary intermediates, which is important when UB is tight.
+- `bubble_up_operation`
+  - is useful here because `extract_slice` and `insert_slice` can otherwise leave expensive slice traffic or avoidable loops in the wrong places.
+- `triton_to_linalg`
+  - converts the remaining structure into a lower-level IR that BiSheng can compile and analyze for memory planning.
+
+With dump files enabled, this stage is captured as `kernel.ttadapter.mlir`.
+
+#### 4.4 TTAdapter to BiSheng / NPU IR
+
+The final stage is `npubin`.
+
+Depending on backend mode, the compiler uses either:
+
+- `linalg_to_bin_enable_npu_compile_A2_A3`, or
+- `linalg_to_bin_enable_npu_compile_910_95`
+
+This stage parses metadata such as:
+
+- `mix_mode`
+- `parallel_mode`
+- `kernel_name`
+- tensor kinds
+
+and then passes hardware policy options into `bishengir-compile`.
+
+For fused attention, this is where the backend makes hardware-facing choices around:
+
+- multi-buffering,
+- synchronization solver usage,
+- vector-loop and cube-loop tiling policy,
+- UB reporting and memory planning,
+- final kernel packaging.
+
+When `TRITON_DEBUG=1` is enabled, the backend also saves BiSheng output as `kernel.npuir.mlir`. This is the best place to inspect:
+
+- whether synchronization-related transformations fired,
+- whether memory-planning diagnostics were emitted,
+- whether UB size information was reported.
+
+### 5. Why causal masking is compiler-sensitive on Ascend
+
+In `_attn_fwd_inner`, causal mode builds:
+
+```python
+mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+```
+
+From an algorithm point of view, this is masked softmax preparation.
+
+From a compiler point of view, it is important because:
+
+- mask shape and access regularity determine whether loads/stores remain structured,
+- irregular masking is often easier to implement by moving more data into UB and selecting values there,
+- explicit mask lowering can introduce additional temporaries, which increases UB pressure,
+- poor handling here can reduce overlap between memory movement and compute.
+
+This is why `discrete_mask_access_conversion` and the structured/unstructured lowering chain are especially relevant to attention kernels.
+
+### 6. Why online softmax is a hardware win
+
+The kernel keeps only:
+
+- the running max `m_i`,
+- the running normalization term `l_i`,
+- the running output accumulator.
+
+This avoids storing the full attention score matrix.
+
+On Ascend hardware, that is valuable because:
+
+- it avoids large GM traffic for temporary attention matrices,
+- it keeps the working set closer to what can fit into UB-backed tiled execution,
+- it makes long-sequence attention feasible without exploding on-chip memory use.
+
+The compiler benefits too:
+
+- fewer global intermediates means fewer bufferization and memory-planning burdens,
+- later passes only need to manage tile-local state and reductions, not a full materialized score tensor.
+
+### 7. How to study the compilation offline
+
+For compiler research, you do not need to execute the kernel on real NPU hardware. The key is to force recompilation and save all stage artifacts.
+
+Recommended environment variables:
+
+```bash
+export TRITON_ALWAYS_COMPILE=1
+export TRITON_KERNEL_DUMP=1
+export TRITON_DEBUG=1
+export TRITON_DUMP_DIR=$PWD/triton_dumps
+```
+
+Then compile the kernel in a Linux environment with the Ascend toolchain configured. Preserve:
+
+- `kernel.ttir.mlir`
+- `kernel.ttadapter.mlir`
+- `kernel.npuir.mlir`
+- metadata JSON
+- final kernel object
+- any UB-related messages printed by BiSheng
+
+For this example, ask the following questions at each stage:
+
+1. Did pointer and mask expressions become more regular?
+2. Did the loop body become easier to pipeline?
+3. Did `extract_slice` and `insert_slice` remain, or were they simplified?
+4. Did any debug output report UB usage or memory planning decisions?
+5. Which backend options appear to control vector/cube tiling or synchronization behavior for this kernel?
+
+### 8. What this example teaches a beginner compiler developer
+
+The most useful lesson is that the Ascend backend is not only translating syntax. It is negotiating between:
+
+- the high-level structure of the Triton algorithm,
+- the limited size of UB and other on-chip resources,
+- the need for regular memory movement,
+- the desire to overlap transfer and compute,
+- the need to coordinate vector-style and cube-style execution resources.
+
+That is why fused attention is such a good research kernel. Its source code already contains the clues:
+
+- fixed-core scheduling,
+- explicit tiling,
+- online reductions,
+- careful accumulator management,
+- masking and block pointers.
+
+The compiler's job is to preserve the parts of that structure that help Ascend hardware, and rewrite the parts that do not.
