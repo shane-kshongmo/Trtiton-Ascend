@@ -67,6 +67,10 @@ print(triton.__file__)
 PY
 ```
 
+If you need to rebuild the local `bishengir-compile` helper, apply the root-repo patch in
+[`third_party/ascend_patches/0001-Fix-LLVM-20-compatibility-for-bishengir-compile.patch`](../third_party/ascend_patches/0001-Fix-LLVM-20-compatibility-for-bishengir-compile.patch)
+to the `third_party/ascend/AscendNPU-IR` submodule before running its standalone build.
+
 ## 2. Dump IR After Each Pass
 
 For research, use the helper script:
