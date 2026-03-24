@@ -53,6 +53,16 @@ This project extends the support for Huawei Ascend NPU (using the CANN software 
 - **Content**: `triton-ascend` driver module.
 - **Description**: Loads and starts the compiled executable binary file.
 
+### 2.3 Recommended Companion Reading
+
+The overview on this page is intentionally compact. For hardware-aware compiler research, the following documents provide the missing detail:
+
+- [Compiler Structure and Ascend Hardware Model](./compiler_structure_and_hardware.md)
+- [Compiler Pass Guide with Ascend Hardware Rationale](./compiler_passes_and_hardware.md)
+- [Build and Dump IR for Ascend Compiler Research](./build_and_dump_ir.md)
+- [Triton Operator Development Guide](./programming_guide.md)
+- [Fused Attention Example](./examples/04_fused_attention_example.md)
+
 
 ## 3. Modules
 
