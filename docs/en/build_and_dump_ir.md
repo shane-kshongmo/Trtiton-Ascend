@@ -31,16 +31,35 @@ sudo apt-get install -y \
   zlib1g-dev \
   python3-pip \
   python3-venv \
-  python3.12-dev \
+  python3.11 \
+  python3.11-dev \
+  python3.11-venv \
   libxml2-dev \
   libzstd-dev
+```
+
+Before creating the virtual environment, confirm that you are using a
+supported interpreter. The repository installation guide currently targets
+Python 3.9 to 3.11. In WSL, use Python 3.11 unless you have a project-specific
+reason to pin a different supported version.
+
+Run this quick preflight first:
+
+```bash
+python3.11 --version
+which python3.11
+which cmake
+which ninja
+which clang
+which lld
 ```
 
 Create and prepare a Python virtual environment:
 
 ```bash
-python3 -m venv ~/venvs/triton-ascend
+python3.11 -m venv ~/venvs/triton-ascend
 source ~/venvs/triton-ascend/bin/activate
+python --version
 pip install -U pip setuptools wheel pybind11 lit ninja
 ```
 
@@ -55,13 +74,22 @@ export TRITON_BUILD_PROTON=OFF
 export TRITON_WHEEL_NAME=triton-ascend
 export TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF"
 
-python setup.py install
+python3.11 setup.py install
+```
+
+If the workspace cannot write to the configured `ccache` location, disable it
+for the build instead of treating that as a compiler failure:
+
+```bash
+export TRITON_BUILD_WITH_CCACHE=false
+export CCACHE_DISABLE=1
+python3.11 setup.py install
 ```
 
 If the import works, the compiler build is ready:
 
 ```bash
-python - <<'PY'
+python3.11 - <<'PY'
 import triton
 print(triton.__file__)
 PY
@@ -77,6 +105,13 @@ If you need to rebuild the local `bishengir-compile` helper, apply the root-repo
 [`third_party/ascend_patches/0001-Fix-LLVM-20-compatibility-for-bishengir-compile.patch`](../third_party/ascend_patches/0001-Fix-LLVM-20-compatibility-for-bishengir-compile.patch)
 to the `third_party/ascend/AscendNPU-IR` submodule before running its standalone build.
 
+If the build fails in
+`bishengir/tools/bishengir-target-spec-tblgen/TargetSpecGen.cpp` with errors
+about `getDirectSuperClasses` or `std::vector<const Record *>`, the local
+AscendNPU-IR checkout is still carrying the wrong LLVM-20 compatibility
+variant. Re-apply the patch above and ensure the LLVM-20/21 branch uses
+`SmallVector<const Record *>` plus `std::vector<const Record *>`.
+
 ## 1.1 Full-Pipeline Prerequisites Checklist
 
 Before trying to dump the full pipeline from any unchanged tutorial or custom
@@ -84,7 +119,8 @@ kernel harness, make sure the active environment satisfies all of the
 following:
 
 - `import triton` works in the Python interpreter you are about to use
-- `import torch` and `import torch_npu` both work
+- one Python-side Ascend frontend is installed:
+  `import torch` plus `import torch_npu`, or `import mindspore`
 - Triton-Ascend was installed with `python setup.py install` or from a built wheel
 - `bishengir-compile` is available on `PATH`, or `TRITON_NPU_COMPILER_PATH` is set
 - `ASCEND_HOME_PATH` is set to a valid Ascend toolkit installation
@@ -92,18 +128,32 @@ following:
 You can check the environment quickly with:
 
 ```bash
+python --version
 python - <<'PY'
 import triton
-import torch
-import torch_npu
 print("triton:", triton.__file__)
-print("torch:", torch.__file__)
-print("torch_npu:", torch_npu.__file__)
+for mod in ("torch", "torch_npu", "mindspore"):
+    try:
+        m = __import__(mod)
+        print(f"{mod}:", m.__file__)
+    except Exception as exc:
+        print(f"{mod}: missing ({exc})")
 PY
 
 which bishengir-compile
 echo "$ASCEND_HOME_PATH"
 ```
+
+If `ASCEND_HOME_PATH` is empty, load the Ascend toolkit first:
+
+```bash
+source /path/to/Ascend/cann-*/set_env.sh
+echo "$ASCEND_HOME_PATH"
+```
+
+When you use `TRITON_NPU_COMPILER_PATH`, point it at the compiler root
+directory, not at the `bishengir-compile` executable itself. The backend may
+append helper names such as `npuc` or `ccec` under that root.
 
 If one of these checks fails, the full pipeline will not run end to end.
 
@@ -143,6 +193,11 @@ For a successful full compile-only dump, expect:
 - `kernel.ttadapter.mlir`
 - `kernel.npuir.mlir`
 - `npuir_passes/`
+
+If the script later raises a Python-side validation error, inspect the newest
+dump directory before treating the run as failed. With `TRITON_COMPILE_ONLY=1`,
+the compiler may already have written the IR files you need even though the
+script does not finish cleanly.
 
 This quick path applies to more than `03-layer-norm.py`. It also works for any
 kernel that already has a runnable Python entry point in the repo, as long as
@@ -185,6 +240,11 @@ setup.
 If the run fails with `0 active drivers`, stop and fix compiler visibility
 before debugging the Python script. That error means Triton could not activate
 the NPU backend at all.
+
+If the script fails after the compile step, inspect the newest dump directory
+first. In compile-only mode, a later Python exception does not invalidate
+`kernel.ttir.mlir`, `kernel.ttadapter.mlir`, `kernel.npuir.mlir`, or
+`npuir_passes/` if those files were already written.
 
 ## 2. Trigger The Pipeline Through Triton Compile
 
@@ -404,6 +464,12 @@ If the compile reaches the `npubin` stage successfully, the backend now also
 asks `bishengir-compile` to dump its own pass pipeline. Those files are copied
 into the Triton dump directory under `npuir_passes/`.
 
+On `Ascend910_95*` targets such as `Ascend910_9599`, some `bishengir-compile`
+builds still try to delegate to a companion executable named
+`bishengir-compile-a5`. If that companion binary is not installed, the compile
+may fail before `kernel.npuir.mlir` is written even though `bishengir-compile`
+itself exists on `PATH`.
+
 `TRITON_DEBUG=1` is required for the downstream AscendNPU-IR pass tree. Using
 `TRITON_KERNEL_DUMP=1` without `TRITON_DEBUG=1` is enough for Triton-stage dump
 files, but not enough for `npuir_passes/`.
@@ -447,6 +513,9 @@ Treat these results as the practical meaning of success:
 - if `kernel.ttir.mlir` and `kernel.ttadapter.mlir` are present, the Triton-Ascend side ran
 - if `kernel.npuir.mlir` is present, the compile reached `bishengir-compile`
 - if `npuir_passes/` is present, full downstream per-pass dumping is enabled
+- if the compile now fails with `No module named 'mindspore'`, `torch_npu`, or
+  `ASCEND_HOME_PATH is not set`, the downstream toolchain was found but the
+  runtime-side Python or CANN environment is incomplete
 
 The script may still raise an exception afterward because
 `TRITON_COMPILE_ONLY=1` skips the actual NPU launch. That later exception does
