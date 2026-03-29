@@ -48,6 +48,7 @@ from triton.backends.ascend.utils import (
     _is_ascend_sanitizer_enabled,
     _is_debug_line_info_disabled,
     _is_auto_map_parallel_blocks_enabled,
+    get_ascend_arch_from_env,
     downgrade_llir,
     force_disable_ffts,
 )
@@ -660,8 +661,9 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             bishengir_hivm_opt = "--enable-hivm-compile=true"
         bin_path = os.path.join(tmpdir, bin_file_with_ext)
         callback_path = os.path.join(tmpdir, "libkernel.so")
+        _arch = get_ascend_arch_from_env() or NPUUtils().get_arch()
         _compile_option_list = [
-            f"--target={NPUUtils().get_arch()}",
+            f"--target={_arch}",
         ]
 
         multibuffer = metadata["multibuffer"]
