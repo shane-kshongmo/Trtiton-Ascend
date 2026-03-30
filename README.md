@@ -1,125 +1,77 @@
-# Triton-Ascend
+# Triton-Ascend (Compile-Only Research Fork)
 
-## Project Overview and Value Proposition
-Triton-Ascend is a Triton compilation framework built for the Ascend platform, aiming to enable Triton code to run efficiently on Ascend hardware.
-- #### Core Value
-Triton is a Python-based compilation framework that has been favored by developers in recent years. Developers only need to focus on the tile/block slicing mode and the computation logic based on tiles/blocks. During the compilation of Triton code, the compiler automatically completes memory allocation, data transfer, data computation, and pipeline parallelism based on the characteristics of underlying hardware. This greatly reduces the operator development difficulty and significantly improves the development efficiency.
-Triton-Ascend adapts the Triton compilation stack to Huawei Ascend NPUs and provides a series of optimizations based on Triton, so that Triton code can run efficiently on Ascend hardware after compilation.
-Currently, Triton-Ascend is still being improved. We will continuously improve the completeness of Triton Python APIs, support more data types, make memory access more flexible, and continuously optimize the automatic optimization capability of the compiler to improve the overall functionality and performance generalization of Triton-Ascend.
-- #### Ascend Ecosystem Positioning
-The Triton-Ascend compilation framework removes the barriers between Triton and Ascend hardware, enabling developers who are familiar with the Triton framework to use Ascend NPUs more efficiently. It provides a universal and efficient operator development paradigm, which is a key part of agile development for the Ascend software stack. This greatly enriches the Ascend operator library and upper-layer application ecosystem.
+This is a **personal research fork** of [Triton-Ascend](https://gitee.com/ascend/triton-ascend) for studying the Ascend compiler pipeline. The primary goal is to dump IR at each compilation pass stage -- **no NPU hardware required**.
 
-## Latest Updates and Milestones
-- #### Latest Updates
-Current version: [Triton-Ascend 3.2.0](https://pypi.org/project/triton-ascend/)
-CANN version: [Ascend CANN Community Edition 8.5.0](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.0)
-Version plan for 2026: Upgrade to Triton 3.5.
-- #### Milestones
-| Milestone| Important Update| Status|
-|------|------|------|
-| 2025.11.14 | The pre-release version Triton-Ascend 3.2.0rc4 is available.<br>[Extended the tt.fp_to_fp API to support conversion to the FP8 type.](https://gitcode.com/Ascend/triton-ascend/pull/891)<br>[Added the scatter_ub_to_out API to support efficient data scattering from the UB to the GM.](https://gitcode.com/Ascend/triton-ascend/pull/864)| ✅ |
-| 2025.09.30 | Improved the Triton Python APIs of the Scan/Sort class, supported non-contiguous memory access, and completed the adaptation of key Triton operators in the vLLM and sglang open-source repositories.| ✅ |
-| 2025.09.19 | Supported the extraction of the Triton-Ascend [nightly package](https://test.pypi.org/project/triton-ascend/#history). | ✅ |
-| 2025.08.15 | Improved the support for the Triton Python APIs of the Atomic class, completed the adaptation of key Triton operators in the Flaggems open-source repository, and provided reference cases for high-performance implementation of simple operators such as Matmul.| ✅ |
-| 2025.06.30 | Supported 85% of Triton Python APIs and contiguous memory access, covering basic application scenarios.| ✅ |
-| 2025.05.20 | Triton-Ascend is open-source, and the GitCode code repository is alive!| ✅ |
-- #### Community Activities
-1. [Meeting calendar](https://meeting.osinfra.cn/ascend)
-2. [Meeting minutes dashboard](https://etherpad-ascend.meeting.osinfra.cn/p/sig-AscendNPU-IR)
+## What This Fork Adds
 
-## Performance Benchmarking
-### Performance Charts of Key Operators
-The key operators FA, MM, and Softmax that have been optimized are selected as examples. The following charts show the performance differences between Triton operators and AscendC operators. The metric is the speedup ratio (`Speedup = AscendC_Duration_Time/Triton_Duration_Time`). For details, see the [Optimization Guide](./docs/en/debug_guide/profiling.md).
+When `TRITON_COMPILE_ONLY=1` is set, the Ascend backend automatically mocks NPU device operations (tensor allocation, streams, device queries) so that **unmodified** Triton kernel scripts run the full MLIR compilation pipeline and dump IR, while kernel launch is skipped.
 
-- FA performance chart:
+```bash
+export TRITON_ASCEND_ARCH=Ascend910_9599
+export TRITON_ALWAYS_COMPILE=1
+export TRITON_COMPILE_ONLY=1
+export TRITON_KERNEL_DUMP=1
+export TRITON_DEBUG=1
+export TRITON_DUMP_DIR=/path/to/dump/dir
 
-![FA performance chart](docs/en/figures/FA_Performance.png)
+python third_party/ascend/tutorials/01-vector-add.py
+```
 
-- MM performance chart:
+This produces per-stage IR files:
+- `kernel.ttir.mlir` -- Triton dialect (high-level tensor ops)
+- `kernel.ttadapter.mlir` -- Linalg/memref dialect (buffer semantics)
+- `kernel.npuir.mlir` -- BiShengIR (NPU binary IR)
+- `npuir_passes/` -- per-pass AscendNPU-IR dumps
 
-![MM performance chart](docs/en/figures/MM_Performance.png)
+No code changes needed in kernel scripts. The `torch.allclose` validation at the end of tutorials will fail (expected -- kernel didn't execute, output tensors are uninitialized).
 
-- Softmax performance chart:
+## Compilation Pipeline
 
-![Softmax performance chart](docs/en/figures/Softmax_Performance.png)
+Triton Python code is compiled through MLIR lowering passes:
 
-## Support
-
-
-- #### Hardware Support
-Triton-Ascend is supported by Ascend AI products. The following table lists the product models.
-
-| Product Series                  | Product Model                             |
-|----------------------------|---------------------------------------|
-| **Atlas A3 training products**  | Atlas 800T A3 SuperNode server           |
-|                            | Atlas 900 A3 SuperPoD server         |
-|                            | A200T A3 Box8 SuperPoD server           |
-| **Atlas A3 inference products**  | Atlas 800I A3 SuperNode server           |
-| **Atlas A2 training products**  | Atlas 800T A2 training server             |
-|                            | Atlas 900 A2 PoD cluster basic unit        |
-|                            | Atlas 200T A2 Box16 heterogeneous subrack         |
-| **Atlas A2 inference products**  | Atlas 800I A2 inference server             |
-|                            | Atlas 300I A2 inference card                 |
-|                            | A200I A2 Box heterogeneous subrack                |
-
-- #### Compatibility
-
-**Supported OSs:**
-The OSs supported by Triton-Ascend are the same as those supported by CANN. Download and install the CANN version that is compatible with your OS. For details, see the official CANN documentation.
-
-**CANN versions:**
-
-- Commercial versions
-
-| Triton-Ascend Version| CANN Commercial Version| Release Date|
-|-------------------|----------------------|--------------------|
-| 3.2.0             | CANN 8.5.0           | 2026/01/16         |
-| 3.2.0rc4          | CANN 8.3.RC2         | 2025/11/20         |
-|                   | CANN 8.3.RC1         | 2025/10/30         |
-
-- Community versions
-
-| Triton-Ascend Version| CANN Community Version| Release Date|
-|-------------------|----------------------|--------------------|
-| 3.2.0             | CANN 8.5.0           | 2026/01/16         |
-| 3.2.0rc4          | CANN 8.3.RC2         | 2025/11/20         |
-|                   | CANN 8.5.0.alpha001  | 2025/11/12         |
-|                   | CANN 8.3.RC1         | 2025/10/30         |
+1. **Triton IR (TTIR)** -- high-level tensor operations from `@triton.jit` kernels
+2. **TTAdapter** -- Ascend-specific lowering: Triton -> Linalg/HFusion/HIVM/Annotation
+3. **NPUIR** -- BiShengIR binary generation via `bishengir-compile`
 
 ## Getting Started
 
-- [Online Documentation](https://triton-ascend.readthedocs.io/zh-cn/latest/index.html)
+- [Quickstart IR Dump](./research_artifacts/QUICKSTART_IR_DUMP.md) -- fastest path to dumping IR
+- [Build and Dump IR Guide](./docs/en/build_and_dump_ir.md) -- full build instructions for WSL
+- [Environment Variables](./docs/en/environment_variable_reference.md)
 
-- [Quick Start](./docs/en/quick_start.md)
+## Prerequisites
 
-- [Installation Guide](./docs/en/installation_guide.md)
+| Component | Version |
+|---|---|
+| Python | 3.10+ |
+| CANN toolkit | 8.5.0 |
+| PyTorch + torch_npu | 2.7.x |
+| Ninja | >= 1.12.0 |
+| CMake | >= 3.18 |
+| Clang/LLD | for building from source |
+
+## Build from Source
+
+```bash
+cd python
+TRITON_BUILD_WITH_CLANG_LLD=true \
+TRITON_BUILD_PROTON=OFF \
+TRITON_WHEEL_NAME="triton-ascend" \
+MAX_JOBS=$(nproc) \
+  python3 setup.py bdist_wheel
+
+pip install dist/triton_ascend-*.whl --force-reinstall --no-deps
+```
+
+## Upstream Documentation
+
+For the full Triton-Ascend documentation (hardware support, performance benchmarks, operator development), see the [upstream project](https://gitee.com/ascend/triton-ascend).
 
 - [Architecture Design and Core Features](./docs/en/architecture_design_and_core_features.md)
-
 - [Compiler Structure and Ascend Hardware Model](./docs/en/compiler_structure_and_hardware.md)
-
 - [Compiler Pass Guide with Ascend Hardware Rationale](./docs/en/compiler_passes_and_hardware.md)
-
 - [Operator Development Guide](./docs/en/programming_guide.md)
 
-- [Operator Migration Guide](./docs/en/migration_guide/migrate_from_gpu.md)
+## License
 
-- [Operator Debugging Guide](./docs/en/debug_guide/debugging.md#)
-
-- [Performance Optimization Guide](./docs/en/debug_guide/profiling.md#)
-
-- [Environment Variables](docs/en/environment_variable_reference.md)
-
-## FAQ
-
-For details about the FAQ encountered when using Triton-Ascend, see [FAQ](./docs/en/FAQ.md#).
-
-## Security Note
-
-We attach great importance to the information security of developers using Triton-Ascend. For details about the security protection suggestions and related information, see [Security Note](./SECURITYNOTE.md).
-
-## License Information
-The code and documents of this project are released under the [MIT License](./LICENSE).
-
-## Community and Contribution
-You are welcome to participate in the development and code contribution of Triton-Ascend. For details, see [Contribution Guide](./CONTRIBUTING.zh.md).
+[MIT License](./LICENSE)
