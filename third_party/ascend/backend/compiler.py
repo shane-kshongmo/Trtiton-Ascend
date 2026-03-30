@@ -24,6 +24,7 @@ import hashlib
 import glob
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -400,6 +401,36 @@ def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: s
     )
 
 
+def _copy_npuir_pass_tree(tree_dir: str, metadata_hash: str):
+    src_root = Path(tree_dir)
+    if not src_root.exists():
+        return
+
+    dump_manager = get_dump_manager(metadata_hash)
+    dst_root = Path(dump_manager.cache_dir) / "npuir_passes"
+    for src in src_root.rglob("*"):
+        if not src.is_file():
+            continue
+        dst = dst_root / src.relative_to(src_root)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+
+
+def _configure_npuir_debug_dump(tmpdir: str, compile_option_list: list[str], opt) -> str:
+    tree_dir = os.path.join(tmpdir, "npuir_passes")
+    if not opt.debug:
+        return tree_dir
+
+    os.makedirs(tree_dir, exist_ok=True)
+    compile_option_list += [
+        "--mlir-disable-threading",
+        "--mlir-print-ir-after-all",
+        f"--mlir-print-ir-tree-dir={tree_dir}",
+        "--bishengir-print-ir-after=hivm-inject-sync",
+    ]
+    return tree_dir
+
+
 def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -559,8 +590,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if mix_mode in ["aic"]:
             _compile_option_list += ["--disable-hfusion-vectorize=true"]
 
-        if opt.debug:
-            _compile_option_list += ["--bishengir-print-ir-after=hivm-inject-sync"]
+        npuir_tree_dir = _configure_npuir_debug_dump(tmpdir, _compile_option_list, opt)
 
         cmd_list = (
             [npu_compiler_path, ttadapter_path]
@@ -585,10 +615,12 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         except subprocess.CalledProcessError as e:
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+                _copy_npuir_pass_tree(npuir_tree_dir, metadata["hash"])
             raise
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+            _copy_npuir_pass_tree(npuir_tree_dir, metadata["hash"])
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -758,8 +790,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 "--enable-triton-kernel-compile=true",
             ]
 
-        if opt.debug:
-            _compile_option_list += ["--bishengir-print-ir-after=hivm-inject-sync"]
+        npuir_tree_dir = _configure_npuir_debug_dump(tmpdir, _compile_option_list, opt)
         cmd_list = (
             [npu_compiler_path, ttadapter_path]
             + _compile_option_list
@@ -779,10 +810,12 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         except subprocess.CalledProcessError as e:
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+                _copy_npuir_pass_tree(npuir_tree_dir, metadata["hash"])
             raise
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+            _copy_npuir_pass_tree(npuir_tree_dir, metadata["hash"])
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -981,12 +1014,22 @@ def ttir_to_npubin(mod, metadata, opt):
                 _compile_option_list += [f"--disable-fma"]
 
         npu_compiler_path, env = _get_npucompiler_path()
+        npuir_tree_dir = _configure_npuir_debug_dump(tmpdir, _compile_option_list, opt)
         cmd_list = (
             [npu_compiler_path, src_path]
             + _compile_option_list
             + ["-o", bin_file]
         )
-        ret = subprocess.run(cmd_list, env = env, capture_output = True, check = True)
+        try:
+            ret = subprocess.run(cmd_list, env=env, capture_output=True, check=True)
+        except subprocess.CalledProcessError as e:
+            if opt.debug:
+                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+                _copy_npuir_pass_tree(npuir_tree_dir, metadata["hash"])
+            raise
+        if opt.debug:
+            _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+            _copy_npuir_pass_tree(npuir_tree_dir, metadata["hash"])
         if not Path(bin_path).exists():
             error_msg = ret.stderr.decode('utf-8')
             print(f"[DEBUG] {bin_path} is not found")
