@@ -48,6 +48,7 @@ from triton.backends.ascend.utils import (
     _is_ascend_sanitizer_enabled,
     _is_debug_line_info_disabled,
     _is_auto_map_parallel_blocks_enabled,
+    get_ascend_arch_from_env,
     downgrade_llir,
     force_disable_ffts,
 )
@@ -536,6 +537,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--append-bisheng-options=-mllvm --cce-vf-remove-membar={enable_cce_vf_remove_membar}"]
 
+        if metadata["enable_vf_fusion"]:
+            _compile_option_list += ["--enable-vf-fusion"]
+
         enable_drop_unit_dims = metadata["enable_drop_unit_dims"]
         if enable_drop_unit_dims is not None:
             _compile_option_list += \
@@ -657,8 +661,9 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             bishengir_hivm_opt = "--enable-hivm-compile=true"
         bin_path = os.path.join(tmpdir, bin_file_with_ext)
         callback_path = os.path.join(tmpdir, "libkernel.so")
+        _arch = get_ascend_arch_from_env() or NPUUtils().get_arch()
         _compile_option_list = [
-            f"--target={NPUUtils().get_arch()}",
+            f"--target={_arch}",
         ]
 
         multibuffer = metadata["multibuffer"]
@@ -903,6 +908,7 @@ class NPUOptions:
     tile_mix_cube_loop: int = None
     disable_auto_inject_block_sync: bool = None
     enable_mixed_cv: bool = None
+    enable_vf_fusion: bool = False
     add_auto_scheduling: bool = False
 
     stream: int = None

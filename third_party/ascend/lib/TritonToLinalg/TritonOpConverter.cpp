@@ -102,12 +102,12 @@ bool getEnvBool(const char* envVar, bool defaultValue)
     if (val == nullptr) {
         return defaultValue;  // variable not set
     }
-    
+
     std::string s(val);
     // Convert to lowercase for easier comparison
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return std::tolower(c); });
-    
+
     // Common false literals
     if (s.empty() || s == "0" || s == "false" || s == "no" || s == "off") {
         return false;
@@ -153,7 +153,7 @@ BitcastConverter::matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
       });
       rewriter.replaceOp(op, adaptor.getSrc());
       return success();
-    } 
+    }
     result = rewriter.create<arith::BitcastOp>(
       loc, resType, adaptor.getSrc());
   } else {
@@ -262,158 +262,114 @@ LogicalResult SelectCanonicalizer::matchAndRewrite(
   });
 
   if (maskPos == MaskPosition::Unknown) {
+    mstate.eraseInsertedOps(op, rewriter);
     return failure();
   }
   auto trueTensor = op.getTrueValue();
   auto falseTensor = op.getFalseValue();
-  tensor::ExtractSliceOp extractSliceOp;
-  tensor::InsertSliceOp insertSliceOp;
 
   // 3. Slice and insert out the masked part
   if (maskPos == MaskPosition::Head) {
     // Slice out the masked part of true tensor
-    extractSliceOp = mstate.getExtractSlice(trueTensor, loc, rewriter);
+    auto extractSliceOp = mstate.getExtractSlice(trueTensor, loc, rewriter);
 
     // Insert out the sliced true tensor into false tensor
-    insertSliceOp =
+    auto insertSliceOp =
         mstate.getInsertSlice(extractSliceOp, falseTensor, loc, rewriter);
-  } else { // maskPos == MaskPosition::Tail or maskPos == MaskPosition::Middle
-    SmallVector<OpFoldResult> invertOffsets;
-    SmallVector<OpFoldResult> invertFalseDims;
-    SmallVector<OpFoldResult> invertTrueDims;
-    Value falseDimVal;
-    OpFoldResult trueDimOp;
-    size_t valDim = -1;
-    for (size_t i = 0; i< mstate.getRank(); ++i) {
-      const auto &offVal = mstate.offsets[i];
-      const auto &dimVal = mstate.dims[i];
-      auto constOffVal = getConstantIntValue(offVal);
-      invertOffsets.push_back(rewriter.getIndexAttr(0));
-      if (constOffVal.has_value() && constOffVal.value() == 0) {
-        invertFalseDims.push_back(dimVal);
-        invertTrueDims.push_back(dimVal);
-      } else {
-        valDim = i;
-        falseDimVal = offVal.get<Value>();
-        invertFalseDims.push_back(offVal);
-        trueDimOp = addOpFoldResult(offVal, dimVal, loc, rewriter);
-        invertTrueDims.push_back(trueDimOp);
-      }
-    }
 
-    // Slice out the invert first masked part of false tensor
-    auto falseExtractSliceOp = mstate.getExtractSlice(falseTensor, loc, rewriter,
-                                                      invertOffsets, invertFalseDims);
-    // Insert out the sliced false tensor into true tensor
-    auto trueInsertSliceOp = mstate.getInsertSlice(falseExtractSliceOp, trueTensor, loc, rewriter,
-                                                   invertOffsets, invertFalseDims);
-    
-    if (valDim != -1) {
-      rewriter.setInsertionPointAfter(trueInsertSliceOp);
-      Value zeroIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-      Value isNegative = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
-                                                        falseDimVal, zeroIndex);
-
-      Value sizeIndex = rewriter.create<arith::ConstantIndexOp>(loc, tensorShape[valDim]);
-      Value isOutOfRange = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge,
-                                                          falseDimVal, sizeIndex);
-      auto orOp = rewriter.create<arith::OrIOp>(loc, isNegative, isOutOfRange);
-      auto ifOp = rewriter.create<scf::IfOp>(loc, TypeRange{type}, orOp.getResult(), true, true);
-
-      Block *thenBlock = &ifOp.getThenRegion().front();
-      rewriter.setInsertionPointToStart(thenBlock);
-      rewriter.create<scf::YieldOp>(loc, ValueRange{trueTensor});
-
-      Block *elseBlock = &ifOp.getElseRegion().front();
-      falseExtractSliceOp->moveBefore(elseBlock, elseBlock->begin());
-      trueInsertSliceOp->moveBefore(elseBlock, elseBlock->end());
-      rewriter.setInsertionPointToStart(elseBlock);
-      {
-        rewriter.setInsertionPointAfter(trueInsertSliceOp);
-        rewriter.create<scf::YieldOp>(loc, ValueRange{trueInsertSliceOp.getResult()});
-      }
-
-      // Slice out the invert first masked and masked part of ifOp result
-      rewriter.setInsertionPointAfter(ifOp);
-      extractSliceOp = mstate.getExtractSlice(ifOp.getResult(0), loc, rewriter,
-                                              invertOffsets, invertTrueDims);
-    } else {
-      // Slice out the invert first masked and masked part of inserted true tensor
-      extractSliceOp = mstate.getExtractSlice(trueInsertSliceOp, loc, rewriter,
-                                              invertOffsets, invertTrueDims);
-    }
-    // Insert out the sliced true tensor into false tensor
-    insertSliceOp = mstate.getInsertSlice(extractSliceOp, falseTensor, loc, rewriter,
-                                          invertOffsets, invertTrueDims);
     LLVM_DEBUG({
-        llvm::dbgs()
-            << "  -> [invert] Created false tensor extractSlice: "
-            << *falseExtractSliceOp.getOperation() << "\n"
-            << "  -> [invert] Created true tensor insertSlice: "
-            << *trueInsertSliceOp.getOperation() << "\n";
-      });
-  }
-  LLVM_DEBUG({
-    llvm::dbgs()
-        << "  -> Created ExtractSlice: "
-        << *extractSliceOp.getOperation() << "\n"
-        << "  -> Created InsertSlice: "
-        << *insertSliceOp.getOperation() << "\n";
-  });
-  rewriter.replaceOp(op, insertSliceOp);
-  return success();
-
-  // 4. Fix if the offset is negative at runtime
-  rewriter.setInsertionPointAfter(insertSliceOp);
-  Value zeroIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-  auto offsets = mstate.offsets;
-  SmallVector<Value> isInvalidVals;
-  for (size_t i = 0; i < offsets.size(); i++) {
-    auto &o = offsets[i];
-    if (o.is<Value>()) {
-      auto oVal = o.get<Value>();
-      int64_t dimSize = tensorShape[i];
-      Value sizeIndex = rewriter.create<arith::ConstantIndexOp>(loc, dimSize);
-      Value isNegative = rewriter.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::slt, oVal, zeroIndex);
-      Value isOutOfRange = rewriter.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::sge, oVal, sizeIndex);
-      isInvalidVals.push_back(isNegative);
-      isInvalidVals.push_back(isOutOfRange);
-    }
-  }
-
-  if (isInvalidVals.empty()) {
+      llvm::dbgs()
+          << "  -> Created ExtractSlice: "
+          << *extractSliceOp.getOperation() << "\n"
+          << "  -> Created InsertSlice: "
+          << *insertSliceOp.getOperation() << "\n";
+    });
     rewriter.replaceOp(op, insertSliceOp);
     return success();
   }
-  // At least one value
-  Value invalidVal = isInvalidVals[0];
-  if (isInvalidVals.size() > 1) {
-    for (int i = 1; i < isInvalidVals.size(); ++i) {
-      auto tmpOrOp = rewriter.create<arith::OrIOp>(loc, isInvalidVals[i], invalidVal);
-      invalidVal = tmpOrOp.getResult();
+
+  // For Tail or Middle positions, we need to compute inverted dimensions
+  // to handle the masking logic
+  SmallVector<OpFoldResult> invertOffsets;
+  SmallVector<OpFoldResult> invertFalseDims;
+  SmallVector<OpFoldResult> invertTrueDims;
+  OpFoldResult falseDimOp;
+  OpFoldResult trueDimOp;
+  int valDim = -1;
+  for (int i = 0; i< mstate.getRank(); ++i) {
+    const auto &offVal = mstate.offsets[i];
+    const auto &dimVal = mstate.dims[i];
+    auto constOffVal = getConstantIntValue(offVal);
+    invertOffsets.push_back(rewriter.getIndexAttr(0));
+    if (constOffVal.has_value() && constOffVal.value() == 0) {
+      invertFalseDims.push_back(dimVal);
+      invertTrueDims.push_back(dimVal);
+    } else {
+      assert(valDim == -1 && "The offset in only one dimension can be not zero.");
+      if (!constOffVal.has_value()) {
+        valDim = i;
+        falseDimOp = offVal;
+      }
+
+      invertFalseDims.push_back(offVal);
+      trueDimOp = addOpFoldResult(offVal, dimVal, loc, rewriter);
+      invertTrueDims.push_back(trueDimOp);
     }
   }
-  // else: what if the number of negative value checks is > 1?
-  auto ifOp = rewriter.create<scf::IfOp>(loc, TypeRange{falseTensor.getType()},
-                                         invalidVal, true /* addThenBlock */,
-                                         true /* addElseBlock */);
-  // thenBuilder
-  rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
-  rewriter.create<scf::YieldOp>(loc, ValueRange{falseTensor});
-  // elseBuilder
-  Block *elseBlock = &ifOp.getElseRegion().front();
-  extractSliceOp->moveBefore(elseBlock, elseBlock->begin());
-  insertSliceOp->moveBefore(elseBlock, elseBlock->end());
-  rewriter.setInsertionPointToStart(elseBlock);
-  {
+
+  // Slice out the invert first masked part of false tensor
+  auto falseExtractSliceOp = mstate.getExtractSlice(falseTensor, loc, rewriter,
+                                                    invertOffsets, invertFalseDims);
+  // Insert out the sliced false tensor into true tensor
+  auto trueInsertSliceOp = mstate.getInsertSlice(falseExtractSliceOp, trueTensor, loc, rewriter,
+                                                 invertOffsets, invertFalseDims);
+  // Slice out the invert first masked and masked part of inserted true tensor
+  auto extractSliceOp = mstate.getExtractSlice(trueInsertSliceOp, loc, rewriter,
+                                               invertOffsets, invertTrueDims);
+  // Insert out the sliced true tensor into false tensor
+  auto insertSliceOp = mstate.getInsertSlice(extractSliceOp, falseTensor, loc, rewriter,
+                                             invertOffsets, invertTrueDims);
+  if (valDim != -1) {
+    rewriter.setInsertionPointAfter(trueInsertSliceOp);
+    assert(falseDimOp.is<Value>() && "Expected to be a runtime Value for dynamic dimension check.");
+    Value zeroIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value isNegative = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
+                                                      falseDimOp.get<Value>(), zeroIndex);
+
+    Value sizeIndex = rewriter.create<arith::ConstantIndexOp>(loc, tensorShape[valDim]);
+    Value isOutOfRange = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge,
+                                                        falseDimOp.get<Value>(), sizeIndex);
+    auto orOp = rewriter.create<arith::OrIOp>(loc, isNegative, isOutOfRange);
+    auto ifOp = rewriter.create<scf::IfOp>(loc, TypeRange{type}, orOp.getResult(), true, true);
+
+    Block *thenBlock = &ifOp.getThenRegion().front();
+    rewriter.setInsertionPointToStart(thenBlock);
+    rewriter.create<scf::YieldOp>(loc, ValueRange{falseTensor});
+
+    Block *elseBlock = &ifOp.getElseRegion().front();
+    rewriter.setInsertionPointToStart(elseBlock);
+    falseExtractSliceOp->moveBefore(elseBlock, elseBlock->begin());
+    trueInsertSliceOp->moveAfter(falseExtractSliceOp);
+    extractSliceOp->moveAfter(trueInsertSliceOp);
+    insertSliceOp->moveAfter(extractSliceOp);
+
     rewriter.setInsertionPointAfter(insertSliceOp);
     rewriter.create<scf::YieldOp>(loc, ValueRange{insertSliceOp.getResult()});
+    rewriter.replaceOp(op, ifOp);
+  } else { // static offsets
+    rewriter.replaceOp(op, insertSliceOp);
   }
-
-  rewriter.replaceOp(op, ifOp);
-
+  LLVM_DEBUG({
+    llvm::dbgs()
+      << "  -> [invert] Created false tensor extractSlice: "
+      << *falseExtractSliceOp.getOperation() << "\n"
+      << "  -> [invert] Created true tensor insertSlice: "
+      << *trueInsertSliceOp.getOperation() << "\n"
+      << "  -> [invert] Created ExtractSlice: "
+      << *extractSliceOp.getOperation() << "\n"
+      << "  -> [invert] Created InsertSlice: "
+      << *insertSliceOp.getOperation() << "\n";
+  });
   return success();
 }
 
@@ -1022,7 +978,7 @@ Value ReduceConverter::cloneReduceOps(OpBuilder &builder, Value in, Value out,
   auto &body = reg.getBlocks().front();
   auto numArguments = 2;
   assert(body.getNumArguments() == numArguments);
-  
+
   Value ttIn = body.getArgument(0);
   Value ttOut = body.getArgument(1);
 
@@ -1065,16 +1021,19 @@ bool ReduceConverter::isMultiOpReduce(
 Value ReduceConverter::computeReduceResultWithCompileFlag(OpBuilder &opBuilder, Location loc, Value lhs, Value rhs,
     Value source, Value initTensor, triton::ReduceOp op, bool compileOn91095Flag) const
 {
-  auto reductionOps = this->getReductionOps(op);
-  assert(reductionOps.size() == 1);
-  if (compileOn91095Flag) {
-    return this->cloneReduceOps(opBuilder,
-                                lhs, rhs,
-                                source, initTensor, op);
+  // Original operation list (including all operations)
+  auto originalReductionOps = this->getReductionOps(op);
+  auto realReductionOps = this->getRealReductionOps(op);
+
+  // If the size of the original operation list is greater than 1,
+  // there are additional operations such as type conversion, and these operations must be cloned.
+  bool needClone = compileOn91095Flag || originalReductionOps.size() > 1;
+  if (needClone) {
+    return this->cloneReduceOps(opBuilder, lhs, rhs, source, initTensor, op);
   } else {
-    auto rop = reductionOps.front();
-    return this->getReductionElement(lhs, rhs, loc, rop,
-                                     opBuilder, false);
+    assert(realReductionOps.size() == 1);
+    auto rop = realReductionOps.front();
+    return this->getReductionElement(lhs, rhs, loc, rop, opBuilder, false);
   }
 }
 
@@ -1086,20 +1045,23 @@ LogicalResult ReduceConverter::convertToTargetOp(
   auto elemType = sourceType.getElementType();
   auto resType = op.getResult().front().getType();
   auto loc = op.getLoc();
-  auto reductionOps = this->getReductionOps(op);
-  auto multiOpReduce = this->isMultiOpReduce(reductionOps);
+
+  // Actual operation list (filtering type conversion operations, leaving only actual reduce operations)
+  auto realReductionOps = this->getRealReductionOps(op);
+
+  bool multiOpReduce = this->isMultiOpReduce(realReductionOps);
   // Reduction of arbitrary operations isn't supported because using the first
   // element across the reduction dimension requires us to iterate over a
   // subview that skips over each first element.
-  if (!multiOpReduce && !this->isReductionOpSupported(reductionOps.front())) {
-     if (compileOn91095Flag) {
- 	  	       llvm_unreachable("All reduction cases expected to be covered");
-     }
+  if (!multiOpReduce && !this->isReductionOpSupported(realReductionOps.front())) {
+    if (compileOn91095Flag) {
+      llvm_unreachable("All reduction cases expected to be covered");
+    }
     return rewriter.notifyMatchFailure(
         op, "Only support lowering reduction with single op and limited types of reduction");
   }
 
-  auto rop = reductionOps.front();
+  auto rop = realReductionOps.front();
   auto ropLoc = rop->getLoc();
   auto axis = op.getAxis();
   auto isVectorReduce = sourceType.getRank() == 1;
@@ -1107,11 +1069,10 @@ LogicalResult ReduceConverter::convertToTargetOp(
   auto constantType = elemType;
 
   auto accBaseConstOp = multiOpReduce ?
- 	     this->getMultiOpReductionBaseConstOp(rewriter, op, ropLoc,  constantType) :
- 	     this->getReductionBaseConstOp(rewriter, rop, constantType);
+      this->getMultiOpReductionBaseConstOp(rewriter, op, ropLoc, constantType) :
+      this->getReductionBaseConstOp(rewriter, rop, constantType);
 
   Value initTensor;
-
   if (isVectorReduce) {
     auto holder = rewriter.create<bufferization::AllocTensorOp>(
         loc, RankedTensorType::get({}, constantType), ValueRange{});
@@ -1435,12 +1396,12 @@ LogicalResult ScanConverter::convertToTargetOpExtended(
   LogicalResult loopResult = success();
   auto processDimension = [&](ArrayRef<Value> baseIdxsArray) {
     llvm::SmallVector<Value> baseIdxs(baseIdxsArray.begin(), baseIdxsArray.end());
-    
+
     auto startInd = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), 0);
     if (reverse) {
       startInd = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), baseShape[axis] - 1);
     }
-    
+
     llvm::SmallVector<Value> firstIdx = baseIdxs;
     if (axis <= firstIdx.size()) {
       firstIdx.insert(firstIdx.begin() + axis, startInd);
@@ -1468,7 +1429,7 @@ LogicalResult ScanConverter::convertToTargetOpExtended(
     rewriter.setInsertionPointToStart(forOp.getBody());
 
     Value k = forOp.getInductionVar();
-    
+
     if (reverse) {
       // Reverse scanning: Convert the forward loop index to the actual reverse index. (axis_size - 1) - k
       Value axisSizeVal = rewriter.create<arith::ConstantIndexOp>(loc, baseShape[axis]);
@@ -1489,7 +1450,7 @@ LogicalResult ScanConverter::convertToTargetOpExtended(
     } else {
       prevIndex = rewriter.create<arith::SubIOp>(loc, k, one);
     }
-    
+
     llvm::SmallVector<Value> prevIdx = baseIdxs;
     if (axis <= prevIdx.size()) {
       prevIdx.insert(prevIdx.begin() + axis, prevIndex);
@@ -2007,23 +1968,44 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
   auto opb = adaptor.getB();
   auto opc = adaptor.getC();
   auto dstType = cast<RankedTensorType>(op.getType());
+  auto elemTy = dstType.getElementType();
   auto inputPrec = op.getInputPrecision();
-
-  if (dstType.getRank() == 2) {
-    auto matmulOp = rewriter.replaceOpWithNewOp<linalg::MatmulOp>(
-        op, ValueRange{opa, opb}, ValueRange{opc});
-    matmulOp->setAttr(
-        "input_precision",
-        rewriter.getStringAttr(stringifyInputPrecision(inputPrec)));
-  } else if (dstType.getRank() == 3) {
-    auto matmulOp = rewriter.replaceOpWithNewOp<linalg::BatchMatmulOp>(
-        op, ValueRange{opa, opb}, ValueRange{opc});
-    matmulOp->setAttr(
-        "input_precision",
-        rewriter.getStringAttr(stringifyInputPrecision(inputPrec)));
-  } else {
+  
+  auto createOp = [&](auto &&rewriter, ValueRange operands, ValueRange results) -> Operation* {
+    if (dstType.getRank() == 2)
+      return rewriter.template create<linalg::MatmulOp>(op.getLoc(), operands, results);
+    else if (dstType.getRank() == 3)
+      return rewriter.template create<linalg::BatchMatmulOp>(op.getLoc(), operands, results);
     llvm_unreachable("Datatype of DotOp operands could only be 2D or 3D");
+  };
+
+  auto replaceOp = [&](auto &&rewriter, ValueRange operands, ValueRange results) -> Operation* {
+    if (dstType.getRank() == 2)
+      return rewriter.template replaceOpWithNewOp<linalg::MatmulOp>(op, operands, results);
+    else if (dstType.getRank() == 3)
+      return rewriter.template replaceOpWithNewOp<linalg::BatchMatmulOp>(op, operands, results);
+    llvm_unreachable("Datatype of DotOp operands could only be 2D or 3D");
+  };
+
+  Operation *matmulOp;
+  if (mlir::isa<mlir::FloatType>(elemTy) && !elemTy.isF32()) {
+    RankedTensorType opcFp32Ty = RankedTensorType::get(dstType.getShape(), rewriter.getF32Type());
+    Value opcFp32 = rewriter.create<arith::ExtFOp>(
+      op.getLoc(),
+      opcFp32Ty,
+      opc
+    );
+    matmulOp = createOp(rewriter, ValueRange{opa, opb}, ValueRange{opcFp32});
+    auto roundModeAttr = hfusion::RoundModeAttr::get(
+        rewriter.getContext(), hfusion::RoundMode::RINT);
+    auto truncOp = rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, dstType, matmulOp->getResult(0));
+    truncOp->setAttr("round_mode", roundModeAttr);
+  } else {
+    matmulOp = replaceOp(rewriter, ValueRange{opa, opb}, ValueRange{opc});
   }
+  matmulOp->setAttr(
+      "input_precision",
+      rewriter.getStringAttr(stringifyInputPrecision(inputPrec)));
   return success();
 }
 
@@ -2710,7 +2692,7 @@ IndirectLoadConverter::matchAndRewrite(triton::ascend::IndirectLoadOp op, OpAdap
   SmallVector<Value> inputVals({src, offsets});
   if (mask)  inputVals.push_back(mask);
   if (other) inputVals.push_back(other);
-  auto callOp = rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(), 
+  auto callOp = rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(),
                                               TypeRange({resTy}),
                                               inputVals);
   rewriter.replaceOp(op, callOp);
@@ -2762,7 +2744,7 @@ LogicalResult
 IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, OpAdaptor adaptor,
                                      ConversionPatternRewriter &rewriter) const {
   auto loc = op.getLoc();
-  
+
   // Get converted operands
   Value src = adaptor.getSrc();
   Value indexTensor = adaptor.getIndex();
@@ -2770,16 +2752,16 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
   auto srcOffsetVals = adaptor.getSrcOffset();
   auto readShapeAttr = op.getReadShape();
   int32_t dim = op.getDim();
-  
+
   // Get result type
   auto resultTensorType = cast<RankedTensorType>(op.getResult().getType());
   auto elemType = resultTensorType.getElementType();
   auto resultShape = resultTensorType.getShape();
-  
+
   // Convert src (tt.ptr -> memref) to the correct memref shape
   // src is now memref<?xT> after type conversion, need to reinterpret to full shape
   auto srcMemRefType = cast<MemRefType>(src.getType());
-  
+
   // Build multi-dimensional memref type
   SmallVector<int64_t> fullSrcShape;
   for (auto shapeVal : srcShapeVals) {
@@ -2790,15 +2772,15 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
     }
   }
   auto fullSrcMemRefType = MemRefType::get(fullSrcShape, elemType);
-  
+
   // Reinterpret cast from 1D to multi-dimensional
   // Build strides: stride[i] = product of all dimensions after i
   SmallVector<OpFoldResult> sizes, strides; // offsets are 0
-  
+
   // Calculate strides from right to left (row-major layout)
   Value currentStride = rewriter.create<arith::ConstantIndexOp>(loc, 1);
   strides.insert(strides.begin(), rewriter.getIndexAttr(1));
-  
+
   for (int i = fullSrcShape.size() - 1; i > 0; --i) {
     // Update stride for next dimension: stride *= size[i]
     if (fullSrcShape[i] != ShapedType::kDynamic) {
@@ -2810,7 +2792,7 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
         strides.insert(strides.begin(), rewriter.getIndexAttr(constOp.value()));
         continue;
       }
-        
+
       strides.insert(strides.begin(), currentStride);
       continue;
     }
@@ -2824,11 +2806,11 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
 
     strides.insert(strides.begin(), currentStride);
   }
-  
+
   for (auto shapeVal : srcShapeVals) {
     OpFoldResult shapeSize;
     if (auto constOp = shapeVal.getDefiningOp<arith::ConstantIndexOp>()) {
-      // Static dimension: 
+      // Static dimension:
       // Use attributes to enable static_sizes to record specific integer values
       shapeSize = rewriter.getIndexAttr(constOp.value());
     } else {
@@ -2863,45 +2845,45 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
   OpFoldResult offset = peelAddPtrChain();
   auto srcMemRef = rewriter.create<memref::ReinterpretCastOp>(
       loc, fullSrcMemRefType, src, offset, sizes, strides);
-  
+
   // Allocate output buffer
   auto resultMemRefType = MemRefType::get(resultShape, elemType);
   auto outputBuffer = rewriter.create<memref::AllocOp>(loc, resultMemRefType);
-  
+
   // Get indices tensor type for extracting
   auto indicesTensorType = cast<RankedTensorType>(indexTensor.getType());
   int64_t numIndices = indicesTensorType.getShape()[0];
-  
+
   // Create for loop
   auto zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   auto numIndicesVal = rewriter.create<arith::ConstantIndexOp>(loc, numIndices);
   auto stepOne = rewriter.create<arith::ConstantIndexOp>(loc, 1);
   auto forOp = rewriter.create<scf::ForOp>(loc, zeroIdx, numIndicesVal, stepOne);
-  
+
   // Mark as parallel loop
   forOp->setAttr("hivm.parallel_loop", rewriter.getUnitAttr());
-  
+
   // Build loop body
   Block *loopBody = forOp.getBody();
   auto savedInsertionPoint = rewriter.saveInsertionPoint();
   rewriter.setInsertionPointToStart(loopBody);
-  
+
   // Remove the terminator temporarily
   Operation *terminator = &loopBody->back();
   rewriter.setInsertionPoint(terminator);
-  
+
   Value iv = forOp.getInductionVar();
-  
+
   // Extract index from indices tensor
   Value selectedIdx = rewriter.create<tensor::ExtractOp>(loc, indexTensor, ValueRange{iv});
   Value selectedIdxAsIndex = rewriter.create<arith::IndexCastOp>(
       loc, rewriter.getIndexType(), selectedIdx);
-  
+
   // Build source subview offsets/sizes/strides
   SmallVector<OpFoldResult> srcSubviewOffsets, srcSubviewSizes, srcSubviewStrides;
   // DenseI32ArrayAttr can be implicitly converted to ArrayRef<int32_t>
   ArrayRef<int32_t> readShape = readShapeAttr;
-  
+
   for (size_t i = 0; i < srcOffsetVals.size(); ++i) {
     if (i == static_cast<size_t>(dim)) {
       // Use the selected index for this dimension
@@ -2919,10 +2901,10 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
     }
     srcSubviewStrides.push_back(rewriter.getIndexAttr(1));
   }
-  
+
   auto srcSubview = rewriter.create<memref::SubViewOp>(
       loc, srcMemRef, srcSubviewOffsets, srcSubviewSizes, srcSubviewStrides);
-  
+
   // Build destination subview
   SmallVector<OpFoldResult> dstSubviewOffsets, dstSubviewSizes, dstSubviewStrides;
   for (size_t i = 0; i < resultShape.size(); ++i) {
@@ -2935,7 +2917,7 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
     }
     dstSubviewStrides.push_back(rewriter.getIndexAttr(1));
   }
-  
+
   auto dstSubview = rewriter.create<memref::SubViewOp>(
       loc, outputBuffer, dstSubviewOffsets, dstSubviewSizes, dstSubviewStrides);
 
@@ -2954,24 +2936,24 @@ IndexSelectSimdConverter::matchAndRewrite(triton::ascend::IndexSelectSimdOp op, 
                        rewriter.getDenseI32ArrayAttr({static_cast<int32_t>(dim)}));
     dstMarkOp->setAttr("hfusion.stride_align_value_in_byte",
                        rewriter.getDenseI32ArrayAttr({32}));
-    
+
     // Copy from source to destination
     rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
   }
-  
+
   // Restore insertion point
   rewriter.restoreInsertionPoint(savedInsertionPoint);
-  
+
   // Convert memref to tensor
   auto resultTensor = rewriter.create<bufferization::ToTensorOp>(
       loc, resultTensorType, outputBuffer, true, true);
-  
+
   // Mark as index_select_simd
   resultTensor->setAttr("index_select_simd", rewriter.getUnitAttr());
-  
+
   // Replace the original op
   rewriter.replaceOp(op, resultTensor);
-  
+
   return success();
 }
 

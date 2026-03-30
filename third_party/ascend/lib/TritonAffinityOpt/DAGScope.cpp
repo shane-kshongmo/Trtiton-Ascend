@@ -174,6 +174,15 @@ void collectOpsToMove(Operation* op, AffinityDAG::Graph& graph,
     }
   }
 
+  if (isa<annotation::MarkOp>(op)) {
+    auto res = op->getOperand(0);
+    if (AffinityDAG::intersects(valueTypes[res], AffinityDAG::CoreType::VECTOR_ONLY)) {
+      needsMoveAiv = true;
+    }
+    if (AffinityDAG::intersects(valueTypes[res], AffinityDAG::CoreType::CUBE_ONLY)) {
+      needsMoveCube = true;
+    }
+  }
   // 检查特定操作类型
   if (isa<hivm::CopyOp>(op)) {
     needsMoveAiv = true;
@@ -782,12 +791,24 @@ static void SplitScope(triton::FuncOp funcOp, AffinityDAG::Graph& graph, Operati
 
  	 static Operation *findInsertionPointAfterWaitForAIV(Operation *waitOp) {
  	   Block *block = waitOp->getBlock();
- 	   auto it = ++waitOp->getIterator();
- 	   for (; it != block->end(); ++it) {
- 	     if (isa<bufferization::ToMemrefOp>(*it) || isa<scf::YieldOp>(*it))
- 	       return &*it;
- 	   }
- 	   return nullptr;
+      auto it = ++waitOp->getIterator();
+      
+      for (; it != block->end(); ++it) {
+        if (isa<bufferization::ToMemrefOp>(*it) || isa<scf::YieldOp>(*it)) {
+          break;
+        }
+      }
+
+      while (it != block->begin()) {
+        auto prevIt = std::prev(it);
+        if (isa<triton::AdvanceOp>(*prevIt)) {
+          it = prevIt;
+        } else {
+          break;
+        }
+      }
+
+      return &*it;
  	 }
 
  	 static Operation *findInsertionPointAfterWaitForAIC(Operation *waitOp) {
